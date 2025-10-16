@@ -1,10 +1,25 @@
 import { NextAuthOptions } from "next-auth"
-import { PrismaAdapter } from "@auth/prisma-adapter"
 import CredentialsProvider from "next-auth/providers/credentials"
 import { prisma } from "./prisma"
 import bcrypt from "bcryptjs"
 
 export const authOptions: NextAuthOptions = {
+  // Garante que o secret seja lido do ambiente em produção
+  secret: process.env.NEXTAUTH_SECRET,
+  // Necessário quando estamos atrás de proxies/CDN (Cloudflare/Vercel)
+  trustHost: true,
+  // Cookies seguros sob HTTPS para evitar sessão vazia em produção
+  cookies: {
+    sessionToken: {
+      name: "__Secure-next-auth.session-token",
+      options: {
+        httpOnly: true,
+        sameSite: "lax",
+        path: "/",
+        secure: true,
+      },
+    },
+  },
   providers: [
     CredentialsProvider({
       name: "credentials",
