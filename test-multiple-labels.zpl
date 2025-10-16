@@ -1,0 +1,31 @@
+^XA
+^PQ3
+^CF0,30
+^FO50,50^FDLabel 1^FS
+^FO50,100^FDFirst Label^FS
+^FO50,150^FDProduct: ABC-123^FS
+^XZ
+
+^XA
+^CF0,30
+^FO50,50^FDLabel 2^FS
+^FO50,100^FDSecond Label^FS
+^FO50,150^FDProduct: DEF-456^FS
+^XZ
+
+^XA
+^CF0,30
+^FO50,50^FDLabel 3^FS
+^FO50,100^FDThird Label^FS
+^FO50,150^FDProduct: GHI-789^FS
+^XZ
+
+
+
+
+
+
+
+
+
+
