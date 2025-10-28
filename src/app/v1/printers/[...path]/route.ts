@@ -8,16 +8,21 @@ async function forward(request: Request, params: { path: string[] }) {
   const targetUrl = `${BASE_TARGET}/v1/printers/${path}`;
 
   const headers = new Headers(request.headers);
-  headers.set('host', new URL(BASE_TARGET).host);
+  // Do not override 'host' header; let fetch set it based on target
+  headers.delete('host');
   headers.set('x-forwarded-host', url.host);
   headers.set('x-forwarded-proto', url.protocol.replace(':', ''));
 
+  // Add timeout to avoid hanging upstream calls
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
   const res = await fetch(targetUrl, {
     method: request.method,
     headers,
     body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
-    redirect: 'manual'
-  });
+    redirect: 'manual',
+    signal: controller.signal
+  }).finally(() => clearTimeout(timeoutId));
 
   return new Response(res.body, {
     status: res.status,

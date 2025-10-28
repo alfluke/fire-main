@@ -7,7 +7,8 @@ export default {
     target.search = url.search;
 
     const headers = new Headers(request.headers);
-    headers.set('host', target.host);
+  // Do not override 'host' header; Cloudflare will set correctly for the target
+  headers.delete('host');
     headers.set('x-forwarded-host', url.host);
     headers.set('x-forwarded-proto', url.protocol.replace(':', ''));
 

@@ -140,6 +140,9 @@ const LABELARY_BASE_URLS: string[] = (process.env.LABELARY_BASE_URLS || inferred
     .map(u => u.trim())
     .filter(Boolean);
 
+// Debug log
+console.log(`[LABELARY] NODE_ENV=${process.env.NODE_ENV}, Using bases:`, LABELARY_BASE_URLS);
+
 function pickUserAgent(seed: number): string {
     return USER_AGENTS[seed % USER_AGENTS.length];
 }
@@ -152,6 +155,35 @@ function computeBackoff(attempt: number, baseMs: number): number {
     const jitter = Math.floor(Math.random() * 250);
     return Math.min(8000, Math.floor(baseMs * Math.pow(2, attempt)) + jitter);
 }
+
+// Global concurrency limiter for Labelary requests (process-wide)
+const MAX_LABELARY_CONCURRENCY: number = Math.max(
+    1,
+    parseInt(process.env.LABELARY_MAX_CONCURRENCY || '4', 10)
+);
+let inFlightLabelaryRequests = 0;
+const labelaryWaitQueue: Array<() => void> = [];
+
+async function acquireLabelarySlot(): Promise<void> {
+    if (inFlightLabelaryRequests < MAX_LABELARY_CONCURRENCY) {
+        inFlightLabelaryRequests += 1;
+        return;
+    }
+    await new Promise<void>(resolve => labelaryWaitQueue.push(resolve));
+    inFlightLabelaryRequests += 1;
+}
+
+function releaseLabelarySlot(): void {
+    inFlightLabelaryRequests = Math.max(0, inFlightLabelaryRequests - 1);
+    const next = labelaryWaitQueue.shift();
+    if (next) next();
+}
+
+// Default timeout for calls to Labelary (ms)
+const LABELARY_FETCH_TIMEOUT_MS: number = Math.max(
+    1000,
+    parseInt(process.env.LABELARY_FETCH_TIMEOUT_MS || '25000', 10)
+);
 
 async function fetchLabelary(
     data: FormData,
@@ -206,36 +238,55 @@ async function fetchLabelary(
 
         console.log(`[LABELARY] Instance ${apiInstanceId} attempt ${attempt + 1}/${maxAttempts} -> ${url.substring(0, 120)}...`);
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers,
-            body: zpl || ''
-        });
+        // Concurrency guard + abortable fetch with timeout
+        await acquireLabelarySlot();
+        const abortController = new AbortController();
+        const timeoutId = setTimeout(() => abortController.abort(), LABELARY_FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: zpl || '',
+                signal: abortController.signal
+            });
 
-        if (response.ok) {
-            console.log(`[LABELARY] ✅ Instance ${apiInstanceId} succeeded on attempt ${attempt + 1}`);
-            return response.arrayBuffer();
+            if (response.ok) {
+                console.log(`[LABELARY] ✅ Instance ${apiInstanceId} succeeded on attempt ${attempt + 1}`);
+                return await response.arrayBuffer();
+            }
+
+            const status = response.status;
+            let retryAfterMs = 0;
+            const retryAfter = response.headers.get('retry-after');
+            if (retryAfter) {
+                const parsed = parseInt(retryAfter, 10);
+                if (!Number.isNaN(parsed)) retryAfterMs = parsed * 1000;
+            }
+            const text = await response.text().catch(() => '');
+            console.warn(`[LABELARY] ⚠️ Instance ${apiInstanceId} attempt ${attempt + 1} failed: ${status} - ${text?.slice(0, 180)}...`);
+
+            if (status === 429 || (status >= 500 && status < 600)) {
+                const delay = Math.max(retryAfterMs, computeBackoff(attempt, baseDelay));
+                console.warn(`[LABELARY] ⏳ Backing off for ${delay}ms before retry (rotate base URL)`);
+                await sleep(delay);
+                continue;
+            }
+
+            // Non-retryable
+            throw new Error(`Labelary API Error: ${status} - ${text}`);
+        } catch (err) {
+            if ((err as Error)?.name === 'AbortError') {
+                console.warn(`[LABELARY] ⏱️ Timeout after ${LABELARY_FETCH_TIMEOUT_MS}ms on attempt ${attempt + 1}`);
+                // Treat as retryable similar to 5xx
+                const delay = computeBackoff(attempt, baseDelay);
+                await sleep(delay);
+                continue;
+            }
+            throw err;
+        } finally {
+            clearTimeout(timeoutId);
+            releaseLabelarySlot();
         }
-
-        const status = response.status;
-        let retryAfterMs = 0;
-        const retryAfter = response.headers.get('retry-after');
-        if (retryAfter) {
-            const parsed = parseInt(retryAfter, 10);
-            if (!Number.isNaN(parsed)) retryAfterMs = parsed * 1000;
-        }
-        const text = await response.text().catch(() => '');
-        console.warn(`[LABELARY] ⚠️ Instance ${apiInstanceId} attempt ${attempt + 1} failed: ${status} - ${text?.slice(0, 180)}...`);
-
-        if (status === 429 || (status >= 500 && status < 600)) {
-            const delay = Math.max(retryAfterMs, computeBackoff(attempt, baseDelay));
-            console.warn(`[LABELARY] ⏳ Backing off for ${delay}ms before retry (rotate base URL)`);
-            await sleep(delay);
-            continue;
-        }
-
-        // Non-retryable
-        throw new Error(`Labelary API Error: ${status} - ${text}`);
     }
 
     throw new Error('Labelary API Error: Exhausted retries due to rate limiting. Please try again later.');

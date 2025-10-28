@@ -11,12 +11,14 @@ export const authOptions: NextAuthOptions = {
   // Cookies seguros sob HTTPS para evitar sessão vazia em produção
   cookies: {
     sessionToken: {
-      name: "__Secure-next-auth.session-token",
+      name: process.env.NODE_ENV === 'production'
+        ? "__Secure-next-auth.session-token"
+        : "next-auth.session-token",
       options: {
         httpOnly: true,
         sameSite: "lax",
         path: "/",
-        secure: true,
+        secure: process.env.NODE_ENV === 'production',
       },
     },
   },
@@ -33,6 +35,21 @@ export const authOptions: NextAuthOptions = {
         if (!credentials?.email || !credentials?.password) {
           console.log("❌ Credenciais incompletas");
           return null
+        }
+
+        // Fallback local (dev-only) sem dependência de banco
+        if (process.env.NODE_ENV !== 'production') {
+          const devEmail = 'admin@admin'
+          const devPassword = 'admin'
+          if (credentials.email === devEmail && credentials.password === devPassword) {
+            console.log("🧪 Dev login fallback aceito para:", devEmail)
+            return {
+              id: 'dev-admin',
+              email: devEmail,
+              name: 'Dev Admin',
+              role: 'admin',
+            }
+          }
         }
 
         const user = await prisma.user.findUnique({
