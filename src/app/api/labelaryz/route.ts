@@ -26,7 +26,7 @@ export async function GET() {
         method: 'POST',
         headers: {
           Accept: 'image/png',
-          'Content-Type': 'text/plain',
+          'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent': 'Fire-Studio-Healthz',
         },
         body: TEST_ZPL

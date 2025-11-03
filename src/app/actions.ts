@@ -2,6 +2,7 @@
 
 import * as z from 'zod';
 import { PDFDocument } from 'pdf-lib';
+import { createHash } from 'crypto';
 
 const formSchema = z.object({
   zpl: z.string().min(1, "ZPL code cannot be empty."),
@@ -156,6 +157,49 @@ function computeBackoff(attempt: number, baseMs: number): number {
     return Math.min(8000, Math.floor(baseMs * Math.pow(2, attempt)) + jitter);
 }
 
+// Simple in-memory LRU cache for Labelary responses (per-process/session)
+type CacheEntry = { ts: number; value: ArrayBuffer };
+const LABELARY_CACHE_MAX_SIZE = Math.max(16, parseInt(process.env.LABELARY_CACHE_MAX_SIZE || '256', 10));
+const labelaryCache: Map<string, CacheEntry> = new Map();
+
+function getLabelaryCacheKey(
+    data: FormData,
+    format: 'png' | 'pdf',
+    labelIndex?: number
+): string {
+    const hash = createHash('sha1').update(data.zpl || '').digest('hex');
+    return [
+        'v1', // bump when key schema changes
+        format,
+        labelIndex ?? 'all',
+        data.dpi,
+        data.width,
+        data.height,
+        data.orientation,
+        data.unit,
+        hash
+    ].join(':');
+}
+
+function lruGet(key: string): ArrayBuffer | undefined {
+    const entry = labelaryCache.get(key);
+    if (!entry) return undefined;
+    // move to recent
+    labelaryCache.delete(key);
+    labelaryCache.set(key, entry);
+    return entry.value;
+}
+
+function lruSet(key: string, value: ArrayBuffer): void {
+    if (labelaryCache.has(key)) labelaryCache.delete(key);
+    labelaryCache.set(key, { ts: Date.now(), value });
+    if (labelaryCache.size > LABELARY_CACHE_MAX_SIZE) {
+        // delete least-recently used (first key)
+        const firstKey = labelaryCache.keys().next().value as string | undefined;
+        if (firstKey) labelaryCache.delete(firstKey);
+    }
+}
+
 // Global concurrency limiter for Labelary requests (process-wide)
 const MAX_LABELARY_CONCURRENCY: number = Math.max(
     1,
@@ -219,9 +263,17 @@ async function fetchLabelary(
     const path = `/v1/printers/${dpmm}dpmm/labels/${widthIn}x${heightIn}/${orientationValue}`
         + (format === 'png' && labelIndex !== undefined ? `/${labelIndex}` : '');
 
-    // We will retry on 429/5xx with exponential backoff and rotate base URLs
-    const maxAttempts = 5;
+    // We will retry on 429/5xx/network timeouts with exponential backoff and rotate base URLs
+    const maxAttempts = Math.max(1, parseInt(process.env.LABELARY_MAX_ATTEMPTS || '6', 10));
     const baseDelay = 350 + (apiInstanceId * 75); // slight staggering per instance
+
+    // Cache fast-path
+    const cacheKey = getLabelaryCacheKey(data, format, labelIndex);
+    const cached = lruGet(cacheKey);
+    if (cached) {
+        console.log(`[LABELARY] 🔁 Cache hit for ${format} idx=${labelIndex ?? 'all'}`);
+        return cached.slice(0) as ArrayBuffer; // return a copy-ish (ArrayBuffer is transferable; slice clones)
+    }
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const baseIndex = (apiInstanceId - 1 + attempt) % LABELARY_BASE_URLS.length;
@@ -252,7 +304,9 @@ async function fetchLabelary(
 
             if (response.ok) {
                 console.log(`[LABELARY] ✅ Instance ${apiInstanceId} succeeded on attempt ${attempt + 1}`);
-                return await response.arrayBuffer();
+                const buf = await response.arrayBuffer();
+                try { lruSet(cacheKey, buf); } catch {}
+                return buf;
             }
 
             const status = response.status;
@@ -275,9 +329,10 @@ async function fetchLabelary(
             // Non-retryable
             throw new Error(`Labelary API Error: ${status} - ${text}`);
         } catch (err) {
-            if ((err as Error)?.name === 'AbortError') {
-                console.warn(`[LABELARY] ⏱️ Timeout after ${LABELARY_FETCH_TIMEOUT_MS}ms on attempt ${attempt + 1}`);
-                // Treat as retryable similar to 5xx
+            const name = (err as Error)?.name || '';
+            const message = (err as Error)?.message || '';
+            if (name === 'AbortError' || /fetch failed|network|ETIMEDOUT|ECONNRESET|EAI_AGAIN/i.test(message)) {
+                console.warn(`[LABELARY] 🌐 Network error on attempt ${attempt + 1}: ${name || ''} ${message || ''}`);
                 const delay = computeBackoff(attempt, baseDelay);
                 await sleep(delay);
                 continue;
@@ -327,7 +382,20 @@ export async function renderZplAction(data: FormData, labelIndex: number): Promi
 }
 
 export async function downloadPdfAction(data: FormData): Promise<string> {
-    // Use ONLY the individual labels approach - ALWAYS works
+    // Estratégia adaptativa: para conjuntos grandes, gerar PDF a partir de PNGs (mais leve)
+    const labelCount = countLabelsInZPL(data.zpl);
+    const forceMode = (process.env.LABELARY_PDF_BUILD_MODE || '').toLowerCase();
+
+    if (forceMode === 'png') {
+        return downloadPdfActionFromPngs(data);
+    }
+
+    if (labelCount > 35) {
+        // Mais eficiente montar via PNG quando há muitas páginas
+        return downloadPdfActionFromPngs(data);
+    }
+
+    // Default: abordagem por PDFs individuais (robusta)
     return downloadPdfActionIndividualLabels(data);
 }
 
@@ -347,15 +415,31 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
         // Split into individual labels - ONE label per API call
         const labels = splitZplIntoIndividualLabels(data.zpl);
         console.log(`[PDF INDIVIDUAL] Split into ${labels.length} individual labels`);
-        
-        const pdfBuffers: ArrayBuffer[] = [];
+
+        // Deduplicate identical labels to minimize API calls
+        const uniqueLabelMap = new Map<string, number>();
+        const uniqueLabels: string[] = [];
+        const originalToUnique: number[] = new Array(labels.length);
+        for (let i = 0; i < labels.length; i++) {
+            const key = createHash('sha1').update(labels[i]).digest('hex');
+            if (!uniqueLabelMap.has(key)) {
+                uniqueLabelMap.set(key, uniqueLabels.length);
+                uniqueLabels.push(labels[i]);
+            }
+            originalToUnique[i] = uniqueLabelMap.get(key)!;
+        }
+        console.log(`[PDF INDIVIDUAL] Deduplicated ${labels.length} -> ${uniqueLabels.length} unique labels`);
+
+        const uniquePdfBuffers: ArrayBuffer[] = [];
 
         // MULTI-REQUEST WORKER SYSTEM: Create dedicated API instances per request
         console.log(`[PDF INDIVIDUAL] WORKER SYSTEM: Processing ${labels.length} labels with dedicated instances`);
         
         // Create unique API pool for this specific request
         const requestId = Date.now() + Math.random();
-        const apiPoolSize = Math.min(3, Math.max(1, Math.floor(labels.length / 10))); // Scale API pool by request size
+        // Allow tuning via env vars
+        const API_POOL_SIZE_MAX = Math.max(1, parseInt(process.env.LABELARY_API_POOL_SIZE_MAX || '4', 10));
+        const apiPoolSize = Math.min(API_POOL_SIZE_MAX, Math.max(1, Math.ceil(labels.length / 12))); // scale with cap
         const apiInstances = Array.from({ length: apiPoolSize }, (_, i) => ({
             id: i + 1,
             inUse: false,
@@ -366,7 +450,7 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
         console.log(`[PDF INDIVIDUAL] Created ${apiPoolSize} dedicated API instances for request ${requestId}`);
         
         // OPTIMIZED WORKER PROCESSING: Process in small batches for maximum speed
-        const batchSize = 2; // Process 2 labels simultaneously 
+        const batchSize = Math.max(1, parseInt(process.env.LABELARY_PDF_BATCH_SIZE || '3', 10)); // tuneable parallelism per batch
         const batches = [];
         for (let i = 0; i < labels.length; i += batchSize) {
             batches.push(labels.slice(i, i + batchSize));
@@ -413,11 +497,11 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
             });
 
             const batchResults = await Promise.all(batchPromises);
-            pdfBuffers.push(...batchResults);
+            uniquePdfBuffers.push(...batchResults);
 
             // Short delay between batches
             if (batchIndex < batches.length - 1) {
-                const batchDelay = 300; // Reduced batch delay
+                const batchDelay = Math.max(50, parseInt(process.env.LABELARY_BATCH_DELAY_MS || '150', 10));
                 console.log(`[PDF INDIVIDUAL] Batch ${batchIndex + 1} completed, waiting ${batchDelay}ms before next batch...`);
                 await new Promise(resolve => setTimeout(resolve, batchDelay));
             }
@@ -426,20 +510,20 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
         console.log(`[PDF INDIVIDUAL] All API instances released for request ${requestId}`);
         
         // Ultra-fast PDF combining with optimized memory usage
-        console.log(`[PDF INDIVIDUAL] All labels processed. Now ultra-fast combining ${pdfBuffers.length} PDFs...`);
+        console.log(`[PDF INDIVIDUAL] All unique labels processed. Now ultra-fast combining ${uniquePdfBuffers.length} PDFs...`);
         const mergedPdf = await PDFDocument.create();
         
         // Process in larger batches for maximum speed
         const mergeBatchSize = labels.length > 30 ? 20 : 15;
         
-        for (let i = 0; i < pdfBuffers.length; i += mergeBatchSize) {
-            const batchEnd = Math.min(i + mergeBatchSize, pdfBuffers.length);
-            console.log(`[PDF INDIVIDUAL] Merging super-batch ${Math.floor(i/mergeBatchSize) + 1}/${Math.ceil(pdfBuffers.length/mergeBatchSize)} (PDFs ${i + 1}-${batchEnd})`);
+        for (let i = 0; i < uniquePdfBuffers.length; i += mergeBatchSize) {
+            const batchEnd = Math.min(i + mergeBatchSize, uniquePdfBuffers.length);
+            console.log(`[PDF INDIVIDUAL] Merging super-batch ${Math.floor(i/mergeBatchSize) + 1}/${Math.ceil(uniquePdfBuffers.length/mergeBatchSize)} (PDFs ${i + 1}-${batchEnd})`);
             
             // Process each PDF in the batch
             const mergePromises = [];
             for (let j = i; j < batchEnd; j++) {
-                mergePromises.push(PDFDocument.load(pdfBuffers[j]));
+                mergePromises.push(PDFDocument.load(uniquePdfBuffers[j]));
             }
             
             // Load all PDFs in this batch simultaneously
@@ -452,13 +536,128 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
             }
         }
         
-        console.log(`[PDF INDIVIDUAL] Final PDF created with ${mergedPdf.getPageCount()} pages (should be ${labels.length})`);
-        const mergedPdfBytes = await mergedPdf.save();
-        const base64Pdf = Buffer.from(mergedPdfBytes).toString('base64');
-        return `data:application/pdf;base64,${base64Pdf}`;
+        // Reconstruct final PDF pages repeating pages according to originalToUnique mapping
+        // We already built merged unique pages; now if there are duplicates, we need to expand.
+        // Simpler approach: if no duplicates, proceed; if duplicates, rebuild by copying pages in order.
+        if (uniqueLabels.length === labels.length) {
+            console.log(`[PDF INDIVIDUAL] Final PDF created with ${mergedPdf.getPageCount()} pages (should be ${labels.length})`);
+            const mergedPdfBytes = await mergedPdf.save();
+            const base64Pdf = Buffer.from(mergedPdfBytes).toString('base64');
+            return `data:application/pdf;base64,${base64Pdf}`;
+        }
+
+        // Duplicate scenario: expand pages in order
+        const expanded = await PDFDocument.create();
+        const sourcePages = await mergedPdf.copyPages(mergedPdf, mergedPdf.getPageIndices());
+        for (const uIdx of originalToUnique) {
+            const page = sourcePages[uIdx];
+            expanded.addPage(page);
+        }
+        console.log(`[PDF INDIVIDUAL] Final PDF created with ${expanded.getPageCount()} pages after expanding duplicates`);
+        const expandedBytes = await expanded.save();
+        const base64Expanded = Buffer.from(expandedBytes).toString('base64');
+        return `data:application/pdf;base64,${base64Expanded}`;
         
     } catch (error) {
         console.warn(`[PDF INDIVIDUAL] Error processing individual labels:`, error);
+        // Fallback: try PNG-based builder with safer parameters when rate limited
+        const msg = (error instanceof Error ? error.message : String(error)) || '';
+        if (/429|rate limit|Exhausted retries/i.test(msg)) {
+            const prevBatch = process.env.LABELARY_PDF_BATCH_SIZE;
+            const prevDelay = process.env.LABELARY_BATCH_DELAY_MS;
+            try {
+                process.env.LABELARY_PDF_BATCH_SIZE = '1';
+                process.env.LABELARY_BATCH_DELAY_MS = '350';
+                console.warn(`[PDF INDIVIDUAL] Falling back to PNG mode with conservative batching...`);
+                return await downloadPdfActionFromPngs(data);
+            } finally {
+                if (prevBatch !== undefined) process.env.LABELARY_PDF_BATCH_SIZE = prevBatch;
+                if (prevDelay !== undefined) process.env.LABELARY_BATCH_DELAY_MS = prevDelay;
+            }
+        }
         throw new Error(`Unable to process ${labelCount} labels individually: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+}
+
+async function downloadPdfActionFromPngs(data: FormData): Promise<string> {
+    const labels = splitZplIntoIndividualLabels(data.zpl);
+    console.log(`[PDF PNG] Building PDF from ${labels.length} PNGs`);
+
+    // Deduplicate identical labels to minimize API calls
+    const uniqueLabelMap = new Map<string, number>();
+    const uniqueLabels: string[] = [];
+    const originalToUnique: number[] = new Array(labels.length);
+    for (let i = 0; i < labels.length; i++) {
+        const key = createHash('sha1').update(labels[i]).digest('hex');
+        if (!uniqueLabelMap.has(key)) {
+            uniqueLabelMap.set(key, uniqueLabels.length);
+            uniqueLabels.push(labels[i]);
+        }
+        originalToUnique[i] = uniqueLabelMap.get(key)!;
+    }
+    console.log(`[PDF PNG] Deduplicated ${labels.length} -> ${uniqueLabels.length} unique labels`);
+
+    const requestId = Date.now() + Math.random();
+    const API_POOL_SIZE_MAX = Math.max(1, parseInt(process.env.LABELARY_API_POOL_SIZE_MAX || '4', 10));
+    const apiPoolSize = Math.min(API_POOL_SIZE_MAX, Math.max(1, Math.ceil(labels.length / 12)));
+    const batchSize = Math.max(1, parseInt(process.env.LABELARY_PDF_BATCH_SIZE || '3', 10));
+    const batchDelay = Math.max(50, parseInt(process.env.LABELARY_BATCH_DELAY_MS || '150', 10));
+    const apiInstances = Array.from({ length: apiPoolSize }, (_, i) => ({ id: i + 1 }));
+
+    // Dimensões físicas da página em pontos (72 pt = 1 in)
+    const unit = data.unit || 'in';
+    const wIn = unit === 'mm' ? (data.width / 25.4) : data.width;
+    const hIn = unit === 'mm' ? (data.height / 25.4) : data.height;
+    const pageW = Math.max(1, Math.round(wIn * 72));
+    const pageH = Math.max(1, Math.round(hIn * 72));
+
+    const pdf = await PDFDocument.create();
+
+    // Processar em lotes paralelos
+    const batches: string[][] = [];
+    for (let i = 0; i < uniqueLabels.length; i += batchSize) {
+        batches.push(uniqueLabels.slice(i, i + batchSize));
+    }
+
+    console.log(`[PDF PNG] request ${requestId} | apiPool=${apiPoolSize} batchSize=${batchSize} batches=${batches.length}`);
+
+    // Pre-allocate embedded images for each unique label
+    const embeddedImgs: any[] = new Array(uniqueLabels.length);
+
+    for (let b = 0; b < batches.length; b++) {
+        const batch = batches[b];
+        const batchStart = b * batchSize;
+        const results = await Promise.all(batch.map(async (label, idx) => {
+            const labelData = { ...data, zpl: label };
+            // Distribui a carga entre instâncias para melhor paralelismo e menos 429
+            const instance = apiInstances[(batchStart + idx) % apiInstances.length];
+            const buf = await fetchLabelary(labelData, 'png', undefined, instance.id);
+            return buf;
+        }));
+
+        for (let i = 0; i < results.length; i++) {
+            const pngBytes = new Uint8Array(results[i]);
+            embeddedImgs[batchStart + i] = await pdf.embedPng(pngBytes);
+        }
+
+        if (b < batches.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, batchDelay));
+        }
+    }
+
+    // Append pages in original order (expand duplicates)
+    for (let i = 0; i < labels.length; i++) {
+        const uIdx = originalToUnique[i];
+        const img = embeddedImgs[uIdx];
+        const page = pdf.addPage([pageW, pageH]);
+        const scale = Math.min(pageW / img.width, pageH / img.height);
+        const drawW = img.width * scale;
+        const drawH = img.height * scale;
+        const x = (pageW - drawW) / 2;
+        const y = (pageH - drawH) / 2;
+        page.drawImage(img, { x, y, width: drawW, height: drawH });
+    }
+
+    const out = await pdf.save();
+    return `data:application/pdf;base64,${Buffer.from(out).toString('base64')}`;
 }
