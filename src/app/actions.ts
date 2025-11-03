@@ -157,6 +157,25 @@ function computeBackoff(attempt: number, baseMs: number): number {
     return Math.min(8000, Math.floor(baseMs * Math.pow(2, attempt)) + jitter);
 }
 
+// Rate limiter por base (intervalo mínimo entre requisições para o mesmo base URL)
+const LABELARY_MIN_INTERVAL_MS = Math.max(0, parseInt(process.env.LABELARY_MIN_INTERVAL_MS || '350', 10));
+const baseNextAvailableAt = new Map<string, number>();
+
+async function awaitBaseSlot(baseUrl: string): Promise<void> {
+    if (LABELARY_MIN_INTERVAL_MS <= 0) return;
+    const now = Date.now();
+    const next = baseNextAvailableAt.get(baseUrl) || 0;
+    const wait = Math.max(0, next - now);
+    if (wait > 0) {
+        await sleep(wait);
+    }
+    const jitter = Math.floor(Math.random() * Math.min(120, LABELARY_MIN_INTERVAL_MS));
+    baseNextAvailableAt.set(baseUrl, Date.now() + LABELARY_MIN_INTERVAL_MS + jitter);
+}
+
+// Coalescer requisições idênticas em voo
+const pendingRequests = new Map<string, Promise<ArrayBuffer>>();
+
 // Simple in-memory LRU cache for Labelary responses (per-process/session)
 type CacheEntry = { ts: number; value: ArrayBuffer };
 const LABELARY_CACHE_MAX_SIZE = Math.max(16, parseInt(process.env.LABELARY_CACHE_MAX_SIZE || '256', 10));
@@ -253,8 +272,8 @@ async function fetchLabelary(
     const safeHeight = height || '6';
     const safeOrientation = orientation || '0';
     
-    const widthIn = safeUnit === 'mm' ? parseFloat(safeWidth) / 25.4 : parseFloat(safeWidth);
-    const heightIn = safeUnit === 'mm' ? parseFloat(safeHeight) / 25.4 : parseFloat(safeHeight);
+    const widthIn = safeUnit === 'mm' ? parseFloat(String(safeWidth)) / 25.4 : parseFloat(String(safeWidth));
+    const heightIn = safeUnit === 'mm' ? parseFloat(String(safeHeight)) / 25.4 : parseFloat(String(safeHeight));
     
     const dpmm = dpiToDpmm(dpi || 203);
     const orientationValue = safeOrientation === '90' ? 1 : 0;
@@ -275,7 +294,16 @@ async function fetchLabelary(
         return cached.slice(0) as ArrayBuffer; // return a copy-ish (ArrayBuffer is transferable; slice clones)
     }
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Se já existe uma requisição idêntica em curso, aguarde seu resultado
+    const inflight = pendingRequests.get(cacheKey);
+    if (inflight) {
+        console.log(`[LABELARY] ⏳ Awaiting inflight for key=${cacheKey.slice(0, 12)}...`);
+        const buf = await inflight;
+        return buf.slice(0) as ArrayBuffer;
+    }
+
+    const runner = (async (): Promise<ArrayBuffer> => {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const baseIndex = (apiInstanceId - 1 + attempt) % LABELARY_BASE_URLS.length;
         const baseUrl = LABELARY_BASE_URLS[baseIndex].replace(/\/$/, '');
         const url = `${baseUrl}${path}`;
@@ -290,8 +318,9 @@ async function fetchLabelary(
 
         console.log(`[LABELARY] Instance ${apiInstanceId} attempt ${attempt + 1}/${maxAttempts} -> ${url.substring(0, 120)}...`);
 
-        // Concurrency guard + abortable fetch with timeout
+        // Concurrency guard + rate slot por base + abortable fetch com timeout
         await acquireLabelarySlot();
+        await awaitBaseSlot(baseUrl);
         const abortController = new AbortController();
         const timeoutId = setTimeout(() => abortController.abort(), LABELARY_FETCH_TIMEOUT_MS);
         try {
@@ -342,9 +371,17 @@ async function fetchLabelary(
             clearTimeout(timeoutId);
             releaseLabelarySlot();
         }
-    }
+        }
+        throw new Error('Labelary API Error: Exhausted retries due to rate limiting. Please try again later.');
+    })();
 
-    throw new Error('Labelary API Error: Exhausted retries due to rate limiting. Please try again later.');
+    pendingRequests.set(cacheKey, runner);
+    try {
+        const result = await runner;
+        return result;
+    } finally {
+        pendingRequests.delete(cacheKey);
+    }
 }
 
 export async function renderZplAction(data: FormData, labelIndex: number): Promise<string> {
@@ -481,8 +518,9 @@ export async function downloadPdfActionIndividualLabels(data: FormData): Promise
                     return pdfBuffer;
                     
                 } catch (error) {
-                    console.warn(`[PDF INDIVIDUAL] ❌ Label ${labelIndex + 1} failed via API ${selectedAPI.id}:`, (error as Error)?.message);
-                    if (error.message.includes('429')) {
+                    const msg = (error as Error)?.message || '';
+                    console.warn(`[PDF INDIVIDUAL] ❌ Label ${labelIndex + 1} failed via API ${selectedAPI.id}:`, msg);
+                    if (msg.includes('429')) {
                         console.warn(`[PDF INDIVIDUAL] Rate limit on API ${selectedAPI.id}, adding extra delay...`);
                         await new Promise(resolve => setTimeout(resolve, selectedAPI.id * 1000));
                         // Retry once
